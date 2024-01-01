@@ -4,6 +4,97 @@ import torch.nn as nn
 from matplotlib import puplot as plt
 from torch import optim 
 
+class DoubleConv(nn.Module):
+    def __init__(self,in_channels,out_channels,mid_channels=None,residual=False):
+        super().__init__()
+        self.residule=residual
+        if not mid_channels:
+            mid_channels=out_channels
+        self.conv=nn.Sequential(
+                nn.Conv2d(in_channels,out_channels,kernel_size=3,padding=1,bias=False),
+                nn.GroupNorm(1,mid_channels),
+                nn.GELU(),
+                nn.Conv2d(out_channels,out_channels,kernel_size=3,padding=1,bias=False),
+                nn.GroupNorm(1,out_channels),
+                )
+    def forward(self,x):
+        if self.residual:
+            return x+self.conv(x)
+        else:
+            return self.conv(x)
+
+class Down(nn.Module):
+    def __init__(self,in_channels,out_channels,emb_dim=256):
+        super().__init__()
+        self.maxpool_conv=nn.Sequential(
+                nn.MaxPool2d(2),
+                DoubleConv(in_channels,out_channels,residual=True),
+                DoubleConv(in_channels,out_channels,residual=True),
+                )
+        
+        self.emb_layer=nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(
+                emb_dim,
+                out_channels
+            ),
+        )
+    def forward(self,x,t):
+        x= self.maxpool_conv(x)
+        emb= self.emb_layer(t)[:,:,None,None].repeat(1,1,x.shape[-2],x.shape[-1])
+        return x+emb
+    
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, emb_dim=256):
+        super().__init__()
+
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv = nn.Sequential(
+            DoubleConv(in_channels, in_channels, residual=True),
+            DoubleConv(in_channels, out_channels, in_channels // 2),
+        )
+
+        self.emb_layer = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(
+                emb_dim,
+                out_channels
+            ),
+        )
+
+    def forward(self, x, skip_x, t):
+        x = self.up(x)
+        x = torch.cat([skip_x, x], dim=1)
+        x = self.conv(x)
+        emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
+        return x + emb
+
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, channels, size):
+        super(SelfAttention, self).__init__()
+        self.channels = channels
+        self.size = size
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        x = x.view(-1, self.channels, self.size * self.size).swapaxes(1, 2)
+        x_ln = self.ln(x)
+        attention_value, _ = self.mha(x_ln, x_ln, x_ln)
+        attention_value = attention_value + x
+        attention_value = self.ff_self(attention_value) + attention_value
+        return attention_value.swapaxes(2, 1).view(-1, self.channels, self.size, self.size)
+
+
 class UNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=3, time_dim=256,device="cuda"):
         super().__init__()
@@ -18,9 +109,9 @@ class UNet(nn.Module):
         self.sa3=SelfAttention(256,8)
 
 
-        self.bot1=DoubelConv(256,512)
-        self.bot2=DoubelConv(512,512)
-        self.bot3=DoubelConv(512,256)
+        self.bot1=DoubleConv(256,512)
+        self.bot2=DoubleConv(512,512)
+        self.bot3=DoubleConv(512,256)
 
         self.up1=Up(512,128)
         self.sa4=SelfAttention(128,16)
